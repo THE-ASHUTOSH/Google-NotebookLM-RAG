@@ -1,153 +1,131 @@
-# 📓 Google NotebookLM-style RAG
+# 📓 NotebookLM-style Corrective RAG (JavaScript)
 
 Upload any document (**PDF, TXT, MD, or DOCX**) and have a grounded conversation
-with it. Answers are generated **only** from the document — never from the LLM's
-general knowledge.
+with it. Answers are generated **only** from the document — never from the
+model's general knowledge.
 
-> **What's new in this update:** the pipeline now uses **LangGraph** for a
-> **Corrective RAG** workflow (retrieve → grade → rewrite → regenerate), with a
-> small **in-process tracer** for observability and **parallel embedding** for
-> large files.
+This is a JavaScript rewrite of the original Python/Streamlit project. The
+corrective retrieval loop is now driven by the **[OpenAI Agents SDK]
+(https://openai.github.io/openai-agents-js/)** — but the model behind it is
+**Gemini**, reached through Gemini's OpenAI-compatible endpoint. The UI is plain
+HTML/CSS/JS served by a small Express server (no build step, no framework).
 
 ```
-Upload ─► Extract ─► Chunk ─► Embed (parallel, Gemini) ─► Index (ChromaDB)
+Upload ─► Extract ─► Chunk ─► Embed (Gemini, parallel) ─► Index (ChromaDB)
                                                                   │
                                                                   ▼
-        Question ─► retrieve ─► grade ─┬─(relevant?)──► generate ─► Answer
-                                       │
-                                       └─(no)──► rewrite query ─► retrieve (loop)
+Question ─► decompose ─► [sub-q1, sub-q2, …]
+                            │  (for each sub-question)
+                            ▼
+                 search_document ─► grade_chunks ─┬─(relevant?)─► pool chunks
+                       ▲                          │
+                       └──── rewrite_query ◄──────┘ (≤ 2× per sub-q)
+                            │
+                            ▼
+                 generate (draft from pooled chunks) ─► verify_answer ─┬─(grounded?)─► answer
+                                                            ▲          │
+                                                            └──────────┘ (revise, ≤ 1×)
 ```
 
 ---
 
-## ✨ What changed vs. plain RAG
+## 🧠 How the Agents SDK drives Corrective RAG
 
-| Concern | Plain RAG | This project |
-|---|---|---|
-| Bad retrieval | Returns "couldn't find that" | Grader detects it, rewriter retries with new phrasing |
-| Orchestration | Inline Python in the UI file | LangGraph `StateGraph` — portable + traceable |
-| Large-file embedding | Sequential, 1 chunk per API call | Parallel `ThreadPoolExecutor` with progress bar |
-| Observability | None | Per-node latency, errors, and token usage shown inline + logged to `traces.jsonl` |
+Instead of a hardcoded state machine, the corrective loop is expressed as
+**five tools** the agent decides when to call ([`src/agent.js`](src/agent.js)):
 
----
+| Tool | What it does |
+|---|---|
+| `decompose_question(question)` | Split a complex/multi-hop question into the minimal set of standalone sub-questions (simple questions pass through unchanged). |
+| `search_document(query)` | Embed the (sub-)query (Gemini) and fetch the top-k chunks from ChromaDB. |
+| `grade_chunks(question)` | One Gemini call marks each retrieved chunk relevant (Y/N). Approved chunks accumulate into a shared pool with stable global `[#n]` labels. |
+| `rewrite_query(...)` | When grading rejects everything for a sub-question, propose new keywords and retry. |
+| `verify_answer(draft)` | Groundedness self-check: confirm every claim in the draft is supported by the cited chunks. If not, the agent revises and re-verifies. |
 
-## 🧠 The LangGraph workflow
+The agent's system instructions encode the policy: *decompose → (per sub-question:
+retrieve → grade → rewrite+retry ≤ 2×) → draft from the pooled chunks → verify
+groundedness (revise ≤ 1×) → final answer with `[#n]` citations.* The model is a
+Gemini model wired into the SDK via a custom `ModelProvider` +
+`OpenAIChatCompletionsModel` pointed at Gemini's OpenAI-compatible base URL
+([`src/config.js`](src/config.js)).
 
-Lives in [`rag/graph.py`](rag/graph.py). Nodes are in
-[`rag/nodes.py`](rag/nodes.py); shared state is
-[`rag/graph_state.py`](rag/graph_state.py).
+### Why this is more than the previous corrective RAG
 
-**Nodes**
+The earlier version (and the original Python one) ran a single
+*retrieve → grade → rewrite → generate* loop. Two failure modes it couldn't
+handle, now fixed:
 
-- `retrieve` — embed the (possibly rewritten) query, fetch top-k chunks from Chroma.
-- `grade` — one LLM call, asks Gemini to mark each retrieved chunk Y/N for
-  relevance. Cheap: chunks are numbered and graded together.
-- `rewrite` — when the grader rejects every chunk, ask Gemini to reword the
-  question with different keywords / synonyms.
-- `generate` — produce the final grounded answer (with citations) from the
-  surviving chunks.
-
-**Edges**
-
-```
-START ─► retrieve ─► grade ─► (conditional)
-                                ├─ "generate" if any chunk passed grading
-                                └─ "rewrite"  if none did and attempts < MAX
-rewrite ─► retrieve   (loop back, attempts++)
-generate ─► END
-```
-
-`MAX_ATTEMPTS` (default 2) caps the corrective loop so a truly off-topic
-question doesn't run forever — after that, `generate` runs anyway and the
-system prompt produces "I couldn't find that in the document."
+- **Multi-hop questions** ("How tall is X *and* when was it built?") — one query
+  rarely retrieves both facts. `decompose_question` splits them, retrieves each
+  independently, and fuses the pooled chunks. Citations stay consistent because
+  the pool assigns stable global `[#n]` labels.
+- **Hallucinated answers** — the old loop only graded *retrieval*; nothing
+  checked the *output*. `verify_answer` catches claims not supported by the
+  chunks and forces a revision before the answer is returned.
 
 ---
 
 ## 🔭 In-process observability (no external service)
 
-[`rag/tracer.py`](rag/tracer.py) gives every graph run:
+[`src/tracer.js`](src/tracer.js) records, for every question:
 
-- A unique `run_id`, total duration, and a list of `NodeEvent`s.
-- Per-node latency and a compact state-diff summary (num docs, num relevant,
-  rewritten query, attempts, answer length).
-- Per-node `tokens_in` / `tokens_out`, captured by routing every Gemini call
-  through [`rag/llm.py`](rag/llm.py) which pulls counts from the SDK's
-  `usage_metadata`.
-- Errors per node — failures are recorded but never crash the response.
+- A `run_id`, total duration, and a per-step list.
+- Per-node latency + a compact summary (sub-questions, chunks retrieved, chunks
+  graded relevant, pool size, rewritten query, groundedness verdict, attempts,
+  answer length).
+- Per-node `tokens_in` / `tokens_out` (from the OpenAI-compatible `usage`
+  field; the agent's own turns are summed via the SDK's aggregated usage).
+- Errors per node — recorded, never crash the response.
 
-How it works:
-
-```python
-with tracer.new_run(question) as run:
-    final = graph.invoke({...})
-# run.events, run.duration_ms, run.total_tokens() all populated
-```
-
-Each completed run is also appended as one JSON line to `traces.jsonl` so you
-can grep / `jq` history without touching the UI. Nothing leaves the machine.
-
-The Streamlit UI renders the trace inline under every answer (look for the
-`🔍 Trace` expander) so you can see *why* a particular answer came out — which
-nodes ran, whether the corrective loop fired, and where the time went.
-
----
-
-## 📦 Portability
-
-The compiled graph is a plain Python object. The same workflow can be:
-
-- Driven from this Streamlit app (current entrypoint).
-- Called from a CLI: `graph.invoke({"question": "...", "history": [], "attempts": 0})`.
-- Wrapped in a FastAPI handler.
-- Deployed to LangGraph Cloud / Platform.
-
-The only Streamlit-specific code lives in `app.py`; everything in `rag/` is
-framework-agnostic. The tracer is also framework-agnostic — `with new_run(...)`
-works the same from any host.
-
----
-
-## ⚡ Large-file optimizations
-
-- **Parallel embedding** — [`rag/embeddings.py`](rag/embeddings.py) uses
-  `ThreadPoolExecutor` (default 8 workers) so a 5,000-chunk PDF embeds in
-  minutes instead of an hour.
-- **Per-document collections + content hashing** — re-uploading the same
-  file reuses the existing Chroma index; no re-embedding cost.
-- **Streamed progress** — the embedding loop calls an `on_progress`
-  callback after every chunk completes, driving the Streamlit progress bar.
-- **Truncated grader inputs** — the grader truncates each chunk to 1,200
-  chars so grading cost stays flat as `chunk_size` grows.
+The UI renders the trace inline under every answer (the `🔍 Trace` expander), and
+each completed run is appended as one JSON line to `traces.jsonl` for offline
+inspection (`tail -f traces.jsonl | jq`).
 
 ---
 
 ## 🛠️ Local setup
 
-**Requirements:** Python 3.10+
+**Requirements:** Node 20+, and a ChromaDB server (the JS Chroma client talks to
+a running server — unlike the Python embedded client).
+
+### 1. Install
 
 ```bash
-cd "Google NotebookLM RAG"
-
-python -m venv .venv
-# Windows
-.venv\Scripts\activate
-# macOS/Linux
-source .venv/bin/activate
-
-pip install -r requirements.txt
+npm install
 ```
 
-Copy `.env.example` to `.env` and fill in:
+### 2. Start ChromaDB
 
-```
-GEMINI_API_KEY=...               # required, free at https://aistudio.google.com/apikey
-```
-
-Run it:
+The simplest options:
 
 ```bash
-streamlit run app.py
+# Option A — Docker
+docker run -d --name chroma -p 8000:8000 chromadb/chroma:0.6.3
+
+# Option B — pip
+pip install chromadb && chroma run --path ./chroma_db --port 8000
 ```
+
+### 3. Configure
+
+Copy `.env.example` to `.env` and add your free
+[Google AI Studio key](https://aistudio.google.com/apikey):
+
+```
+GEMINI_API_KEY=...
+# GEMINI_BASE_URL, CHAT_MODEL, EMBED_MODEL, CHROMA_URL, PORT all have defaults
+```
+
+The same key powers both the Gemini chat model (via the Agents SDK) and Gemini
+embeddings.
+
+### 4. Run
+
+```bash
+npm start          # or: npm run dev   (auto-restart on file change)
+```
+
+Open **http://localhost:3000**, upload a document, and start asking questions.
 
 ---
 
@@ -155,22 +133,37 @@ streamlit run app.py
 
 ```
 .
-├── app.py                  # Streamlit UI — drives the LangGraph workflow
-├── rag/
-│   ├── loader.py           # PDF/TXT/MD/DOCX → text
-│   ├── chunker.py          # Recursive character chunking
-│   ├── embeddings.py       # Parallel Gemini embeddings (ThreadPoolExecutor)
-│   ├── vectorstore.py      # ChromaDB persistent store
-│   ├── llm.py              # Single entry-point for Gemini text gen + token capture
-│   ├── generator.py        # Grounded answer generation
-│   ├── graph_state.py      # TypedDict state shared between nodes
-│   ├── nodes.py            # retrieve / grade / rewrite / generate + decision
-│   ├── graph.py            # StateGraph wiring + compile
-│   └── tracer.py           # In-process tracing (run / node events / JSONL log)
-├── requirements.txt
+├── server.js               # Express server: /api/upload, /api/chat, static UI
+├── src/
+│   ├── config.js           # env + Gemini-as-OpenAI model provider (Agents SDK)
+│   ├── loader.js           # PDF (pdfjs-dist) / TXT / MD / DOCX (mammoth) → text
+│   ├── chunker.js          # recursive character chunking with overlap
+│   ├── embeddings.js       # Gemini embeddings, bounded parallelism
+│   ├── vectorstore.js      # ChromaDB client (per-document collections)
+│   ├── agent.js            # Corrective RAG agent + 5 tools (decompose, search,
+│   │                       #   grade, rewrite, verify) — OpenAI Agents SDK
+│   └── tracer.js           # in-process tracing → traces.jsonl
+├── public/
+│   ├── index.html          # NotebookLM-style UI (sidebar + chat)
+│   ├── style.css
+│   └── app.js              # upload + chat frontend logic
+├── package.json
 ├── .env.example
 └── README.md
 ```
+
+---
+
+## ⚙️ Notes & defaults
+
+- **Per-document collections + content hashing** — re-uploading the same file
+  reuses the existing Chroma index, so no re-embedding cost.
+- **Parallel embedding** — chunks embed in bounded-concurrency batches (8 at a
+  time) so large files index quickly.
+- **Truncated grader input** — each chunk is truncated to 1,200 chars when sent
+  to the grader, keeping grading cost flat as chunk size grows.
+- **Single-user demo** — the loaded document and chat history live in-process,
+  so it's meant for one user at a time.
 
 ---
 

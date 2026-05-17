@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>📓 NotebookLM RAG</title>
+    <link rel="stylesheet" href="/style.css" />
+    <link
+      rel="icon"
+      href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📓</text></svg>"
+    />
+  </head>
+  <body>
+    <aside class="sidebar">
+      <header class="brand">
+        <h1>📓 NotebookLM RAG</h1>
+        <p class="tag">OpenAI Agents SDK · Gemini · ChromaDB</p>
+      </header>
+
+      <section class="panel">
+        <h2>1 · Upload</h2>
+        <label class="dropzone" id="dropzone">
+          <input type="file" id="file" accept=".pdf,.txt,.md,.docx" hidden />
+          <span class="dz-icon">⬆️</span>
+          <span class="dz-text">Drop a file or <u>browse</u></span>
+          <span class="dz-hint">PDF · TXT · MD · DOCX</span>
+        </label>
+      </section>
+
+      <section class="panel">
+        <h2>2 · Settings</h2>
+        <label class="slider">
+          Chunk size <output id="chunkSizeOut">1000</output>
+          <input type="range" id="chunkSize" min="400" max="2000" step="100" value="1000" />
+        </label>
+        <label class="slider">
+          Chunk overlap <output id="chunkOverlapOut">150</output>
+          <input type="range" id="chunkOverlap" min="0" max="400" step="25" value="150" />
+        </label>
+        <label class="slider">
+          Top-k chunks <output id="topKOut">4</output>
+          <input type="range" id="topK" min="1" max="10" step="1" value="4" />
+        </label>
+      </section>
+
+      <section class="panel status" id="statusPanel" hidden>
+        <h2>Loaded</h2>
+        <p class="doc-name" id="docName"></p>
+        <p class="doc-meta" id="docMeta"></p>
+        <button class="btn-ghost" id="clearChat">Clear chat</button>
+      </section>
+
+      <footer class="side-foot">
+        Corrective RAG: retrieve → grade → rewrite? → answer.<br />
+        Traces logged to <code>traces.jsonl</code>.
+      </footer>
+    </aside>
+
+    <main class="chat">
+      <header class="chat-head">
+        <h2 id="chatTitle">Chat with your document</h2>
+      </header>
+
+      <div class="messages" id="messages">
+        <div class="empty" id="emptyState">
+          <div class="empty-icon">📄</div>
+          <p>Upload a document in the sidebar to get started.</p>
+        </div>
+      </div>
+
+      <form class="composer" id="composer">
+        <input
+          type="text"
+          id="question"
+          placeholder="Ask a question about the document…"
+          autocomplete="off"
+          disabled
+        />
+        <button type="submit" id="send" disabled>Send</button>
+      </form>
+    </main>
+
+    <div class="toast" id="toast" hidden></div>
+
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>
