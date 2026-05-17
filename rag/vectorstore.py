@@ -4,7 +4,7 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 import chromadb
 from chromadb.config import Settings
@@ -49,10 +49,15 @@ class VectorStore:
         except Exception:
             return False
 
-    def add_chunks(self, chunks: List[str], metadatas: Optional[List[dict]] = None) -> None:
+    def add_chunks(
+        self,
+        chunks: List[str],
+        metadatas: Optional[List[dict]] = None,
+        on_progress: Optional[Callable[[int, int], None]] = None,
+    ) -> None:
         if not chunks:
             return
-        vectors = embeddings.embed_documents(chunks)
+        vectors = embeddings.embed_documents(chunks, on_progress=on_progress)
         ids = [f"chunk_{i}" for i in range(len(chunks))]
         metas = metadatas or [{"chunk_index": i} for i in range(len(chunks))]
         self.collection.add(

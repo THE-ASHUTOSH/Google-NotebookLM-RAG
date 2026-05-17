@@ -3,8 +3,7 @@ from __future__ import annotations
 
 from typing import Iterable, List, Tuple
 
-import google.generativeai as genai
-
+from . import llm
 from .vectorstore import Retrieved
 
 
@@ -64,9 +63,5 @@ def generate_answer(
     ]
     prompt = "\n".join(prompt_parts)
 
-    model = genai.GenerativeModel(
-        model_name=GEN_MODEL,
-        system_instruction=SYSTEM_INSTRUCTION,
-    )
-    response = model.generate_content(prompt)
-    return (response.text or "").strip() or "I couldn't find that in the document."
+    text = llm.call(GEN_MODEL, prompt, system=SYSTEM_INSTRUCTION)
+    return text or "I couldn't find that in the document."

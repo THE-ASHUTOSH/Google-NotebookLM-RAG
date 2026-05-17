@@ -1,49 +1,123 @@
 # 📓 Google NotebookLM-style RAG
 
-Upload any document (**PDF, TXT, MD, or DOCX**) and have a grounded conversation with it.
-Answers are generated **only** from the document's contents — never from the LLM's general knowledge.
+Upload any document (**PDF, TXT, MD, or DOCX**) and have a grounded conversation
+with it. Answers are generated **only** from the document — never from the LLM's
+general knowledge.
 
-Built end-to-end as a full RAG pipeline:
+> **What's new in this update:** the pipeline now uses **LangGraph** for a
+> **Corrective RAG** workflow (retrieve → grade → rewrite → regenerate), with a
+> small **in-process tracer** for observability and **parallel embedding** for
+> large files.
 
 ```
-Upload ─► Extract ─► Chunk ─► Embed (Gemini) ─► Index (ChromaDB)
-                                                       │
-                                                       ▼
-        Question ─► Embed ─► Top-k retrieve ─► Gemini grounded answer
+Upload ─► Extract ─► Chunk ─► Embed (parallel, Gemini) ─► Index (ChromaDB)
+                                                                  │
+                                                                  ▼
+        Question ─► retrieve ─► grade ─┬─(relevant?)──► generate ─► Answer
+                                       │
+                                       └─(no)──► rewrite query ─► retrieve (loop)
 ```
 
 ---
 
-## ✨ Features
+## ✨ What changed vs. plain RAG
 
-- **Multi-format ingestion** — PDF, TXT, Markdown, DOCX
-- **Recursive character chunking** with overlap for context preservation
-- **Gemini `text-embedding-004`** for embeddings (asymmetric: doc vs. query task types)
-- **ChromaDB** persistent vector store with cosine similarity
-- **Gemini 2.0 Flash** for grounded answer generation
-- **Multi-turn chat** — conversation history is passed to the model
-- **Source attribution** — every answer shows the chunks it was based on, with similarity scores
-- **Per-document collections** — re-uploading the same file reuses the existing index
+| Concern | Plain RAG | This project |
+|---|---|---|
+| Bad retrieval | Returns "couldn't find that" | Grader detects it, rewriter retries with new phrasing |
+| Orchestration | Inline Python in the UI file | LangGraph `StateGraph` — portable + traceable |
+| Large-file embedding | Sequential, 1 chunk per API call | Parallel `ThreadPoolExecutor` with progress bar |
+| Observability | None | Per-node latency, errors, and token usage shown inline + logged to `traces.jsonl` |
 
 ---
 
-## 🧠 Chunking strategy
+## 🧠 The LangGraph workflow
 
-The chunker is a **recursive character splitter** in [`rag/chunker.py`](rag/chunker.py).
+Lives in [`rag/graph.py`](rag/graph.py). Nodes are in
+[`rag/nodes.py`](rag/nodes.py); shared state is
+[`rag/graph_state.py`](rag/graph_state.py).
 
-It tries to split on the strongest semantic boundary that keeps every piece under
-`chunk_size`, falling back through this hierarchy:
+**Nodes**
+
+- `retrieve` — embed the (possibly rewritten) query, fetch top-k chunks from Chroma.
+- `grade` — one LLM call, asks Gemini to mark each retrieved chunk Y/N for
+  relevance. Cheap: chunks are numbered and graded together.
+- `rewrite` — when the grader rejects every chunk, ask Gemini to reword the
+  question with different keywords / synonyms.
+- `generate` — produce the final grounded answer (with citations) from the
+  surviving chunks.
+
+**Edges**
 
 ```
-paragraph (\n\n) → line (\n) → sentence (. ? !) → clause (; ,) → word ( ) → char
+START ─► retrieve ─► grade ─► (conditional)
+                                ├─ "generate" if any chunk passed grading
+                                └─ "rewrite"  if none did and attempts < MAX
+rewrite ─► retrieve   (loop back, attempts++)
+generate ─► END
 ```
 
-After splitting, adjacent fragments are greedily merged so we don't end up with
-hundreds of tiny pieces, and a configurable **overlap** of trailing characters is
-prepended to the next chunk so a sentence straddling a boundary still appears
-(in part) on both sides. This reduces "lost-at-the-seam" retrieval failures.
+`MAX_ATTEMPTS` (default 2) caps the corrective loop so a truly off-topic
+question doesn't run forever — after that, `generate` runs anyway and the
+system prompt produces "I couldn't find that in the document."
 
-Defaults: `chunk_size=1000`, `chunk_overlap=150`, both adjustable from the UI.
+---
+
+## 🔭 In-process observability (no external service)
+
+[`rag/tracer.py`](rag/tracer.py) gives every graph run:
+
+- A unique `run_id`, total duration, and a list of `NodeEvent`s.
+- Per-node latency and a compact state-diff summary (num docs, num relevant,
+  rewritten query, attempts, answer length).
+- Per-node `tokens_in` / `tokens_out`, captured by routing every Gemini call
+  through [`rag/llm.py`](rag/llm.py) which pulls counts from the SDK's
+  `usage_metadata`.
+- Errors per node — failures are recorded but never crash the response.
+
+How it works:
+
+```python
+with tracer.new_run(question) as run:
+    final = graph.invoke({...})
+# run.events, run.duration_ms, run.total_tokens() all populated
+```
+
+Each completed run is also appended as one JSON line to `traces.jsonl` so you
+can grep / `jq` history without touching the UI. Nothing leaves the machine.
+
+The Streamlit UI renders the trace inline under every answer (look for the
+`🔍 Trace` expander) so you can see *why* a particular answer came out — which
+nodes ran, whether the corrective loop fired, and where the time went.
+
+---
+
+## 📦 Portability
+
+The compiled graph is a plain Python object. The same workflow can be:
+
+- Driven from this Streamlit app (current entrypoint).
+- Called from a CLI: `graph.invoke({"question": "...", "history": [], "attempts": 0})`.
+- Wrapped in a FastAPI handler.
+- Deployed to LangGraph Cloud / Platform.
+
+The only Streamlit-specific code lives in `app.py`; everything in `rag/` is
+framework-agnostic. The tracer is also framework-agnostic — `with new_run(...)`
+works the same from any host.
+
+---
+
+## ⚡ Large-file optimizations
+
+- **Parallel embedding** — [`rag/embeddings.py`](rag/embeddings.py) uses
+  `ThreadPoolExecutor` (default 8 workers) so a 5,000-chunk PDF embeds in
+  minutes instead of an hour.
+- **Per-document collections + content hashing** — re-uploading the same
+  file reuses the existing Chroma index; no re-embedding cost.
+- **Streamed progress** — the embedding loop calls an `on_progress`
+  callback after every chunk completes, driving the Streamlit progress bar.
+- **Truncated grader inputs** — the grader truncates each chunk to 1,200
+  chars so grading cost stays flat as `chunk_size` grows.
 
 ---
 
@@ -52,7 +126,6 @@ Defaults: `chunk_size=1000`, `chunk_overlap=150`, both adjustable from the UI.
 **Requirements:** Python 3.10+
 
 ```bash
-git clone <your-repo-url>
 cd "Google NotebookLM RAG"
 
 python -m venv .venv
@@ -64,13 +137,11 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Create a `.env` file (copy from `.env.example`):
+Copy `.env.example` to `.env` and fill in:
 
 ```
-GEMINI_API_KEY=your_key_here
+GEMINI_API_KEY=...               # required, free at https://aistudio.google.com/apikey
 ```
-
-Get a free key at <https://aistudio.google.com/apikey>.
 
 Run it:
 
@@ -78,48 +149,28 @@ Run it:
 streamlit run app.py
 ```
 
-Open <http://localhost:8501>, upload a file from the sidebar, and start asking questions.
-
----
-
-## ☁️ Deploy on Streamlit Community Cloud
-
-1. Push this repo to GitHub (public).
-2. Go to <https://share.streamlit.io> and click **New app**.
-3. Pick the repo, branch, and `app.py` as the entrypoint.
-4. Under **Advanced settings → Secrets**, add:
-   ```toml
-   GEMINI_API_KEY = "your_key_here"
-   ```
-5. Deploy. The live URL is your submission link.
-
 ---
 
 ## 📁 Project structure
 
 ```
 .
-├── app.py                  # Streamlit UI + orchestration
+├── app.py                  # Streamlit UI — drives the LangGraph workflow
 ├── rag/
 │   ├── loader.py           # PDF/TXT/MD/DOCX → text
 │   ├── chunker.py          # Recursive character chunking
-│   ├── embeddings.py       # Gemini embeddings
+│   ├── embeddings.py       # Parallel Gemini embeddings (ThreadPoolExecutor)
 │   ├── vectorstore.py      # ChromaDB persistent store
-│   └── generator.py        # Grounded answer generation
+│   ├── llm.py              # Single entry-point for Gemini text gen + token capture
+│   ├── generator.py        # Grounded answer generation
+│   ├── graph_state.py      # TypedDict state shared between nodes
+│   ├── nodes.py            # retrieve / grade / rewrite / generate + decision
+│   ├── graph.py            # StateGraph wiring + compile
+│   └── tracer.py           # In-process tracing (run / node events / JSONL log)
 ├── requirements.txt
 ├── .env.example
 └── README.md
 ```
-
----
-
-## 🔒 Grounding & anti-hallucination
-
-The generator's system instruction strictly forbids using outside knowledge and
-tells the model to respond `"I couldn't find that in the document."` when the
-answer is absent. The prompt also asks for inline citations like `[#1]`
-matching the order of retrieved chunks shown in the UI's **Sources** panel,
-so you can verify every claim against the source text.
 
 ---
 

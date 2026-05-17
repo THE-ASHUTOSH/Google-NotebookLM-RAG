@@ -15,6 +15,9 @@ env/
 # Vector store (regenerated on each run)
 chroma_db/
 
+# Local trace log (regenerated on each query)
+traces.jsonl
+
 # Uploaded user files (do not commit)
 data/uploads/
 

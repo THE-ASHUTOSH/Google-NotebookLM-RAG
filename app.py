@@ -1,19 +1,27 @@
 """
-Google NotebookLM-style RAG chat over a user-uploaded document.
+Corrective RAG over a user-uploaded document (NotebookLM-style UI).
 
-Pipeline: upload -> extract text -> chunk -> embed (Gemini) ->
-store (Chroma) -> retrieve top-k -> generate grounded answer (Gemini).
+Ingestion pipeline (parallel-embedded for large files):
+    upload -> extract text -> chunk -> embed (parallel, Gemini) -> Chroma
+
+Query workflow (LangGraph Corrective RAG):
+    retrieve -> grade -> (rewrite -> retrieve)* -> generate
+
+Observability is built-in: each graph invocation runs inside a `Run` context
+that records per-node latency, errors, and token usage. The trace is shown
+inline below every answer and appended to `traces.jsonl` for later inspection.
 """
 from __future__ import annotations
 
 import os
+from dataclasses import asdict
 
 import streamlit as st
 from dotenv import load_dotenv
 
-from rag import embeddings
+from rag import embeddings, tracer
 from rag.chunker import chunk_text
-from rag.generator import generate_answer
+from rag.graph import build_graph
 from rag.loader import SUPPORTED_EXTENSIONS, load_document
 from rag.vectorstore import VectorStore
 
@@ -45,12 +53,13 @@ def reset_chat():
 def init_state():
     st.session_state.setdefault("messages", [])
     st.session_state.setdefault("store", None)
+    st.session_state.setdefault("graph", None)
     st.session_state.setdefault("doc_name", None)
     st.session_state.setdefault("num_chunks", 0)
 
 
 def ingest_file(uploaded_file, chunk_size: int, chunk_overlap: int, top_k: int):
-    """Run the ingestion pipeline and store the resulting VectorStore in session."""
+    """Run the ingestion pipeline and build a LangGraph workflow over the store."""
     data = uploaded_file.getvalue()
     name = uploaded_file.name
 
@@ -78,7 +87,12 @@ def ingest_file(uploaded_file, chunk_size: int, chunk_overlap: int, top_k: int):
         if store.has_data():
             st.write("Found existing index for this document — reusing it.")
         else:
-            st.write("Embedding chunks with Gemini text-embedding-004...")
+            st.write("Embedding chunks with Gemini (parallel batches)...")
+            progress = st.progress(0.0, text=f"Embedded 0 / {len(chunks)}")
+
+            def on_progress(done: int, total: int) -> None:
+                progress.progress(done / total, text=f"Embedded {done} / {total}")
+
             metadatas = [
                 {
                     "chunk_index": c.index,
@@ -88,10 +102,15 @@ def ingest_file(uploaded_file, chunk_size: int, chunk_overlap: int, top_k: int):
                 }
                 for c in chunks
             ]
-            store.add_chunks([c.text for c in chunks], metadatas=metadatas)
+            store.add_chunks(
+                [c.text for c in chunks],
+                metadatas=metadatas,
+                on_progress=on_progress,
+            )
             st.write("Indexed in ChromaDB.")
 
         st.session_state.store = store
+        st.session_state.graph = build_graph(store, top_k=top_k)
         st.session_state.doc_name = name
         st.session_state.num_chunks = len(chunks)
         st.session_state.top_k = top_k
@@ -102,7 +121,7 @@ def ingest_file(uploaded_file, chunk_size: int, chunk_overlap: int, top_k: int):
 def render_sidebar():
     with st.sidebar:
         st.title("📓 NotebookLM RAG")
-        st.caption("Upload a document and chat with it.")
+        st.caption("LangGraph corrective RAG · Gemini · ChromaDB")
 
         api_key = get_api_key()
         if not api_key:
@@ -132,8 +151,10 @@ def render_sidebar():
                 ingest_file(uploaded, chunk_size, chunk_overlap, top_k)
                 st.session_state.loaded_sig = sig
             else:
-                # Keep top_k responsive to slider even without re-ingesting.
-                st.session_state.top_k = top_k
+                # Rebuild the graph if top_k slider changed.
+                if st.session_state.get("top_k") != top_k and st.session_state.store:
+                    st.session_state.graph = build_graph(st.session_state.store, top_k=top_k)
+                    st.session_state.top_k = top_k
 
         st.divider()
         if st.session_state.doc_name:
@@ -147,29 +168,61 @@ def render_sidebar():
 
         st.divider()
         st.caption(
-            "Stack: Streamlit · Gemini (text-embedding-004 + gemini-2.0-flash) · "
-            "ChromaDB · recursive char chunking."
+            "Workflow: LangGraph (retrieve → grade → rewrite? → generate)\n\n"
+            "Tracing: in-process · written to `traces.jsonl`"
         )
+
+
+def _render_trace(trace: dict | None) -> None:
+    """Render an expandable per-question trace summary."""
+    if not trace or not trace.get("events"):
+        return
+    total = trace.get("duration_ms", 0.0)
+    tokens_in = sum(e["summary"].get("tokens_in", 0) for e in trace["events"])
+    tokens_out = sum(e["summary"].get("tokens_out", 0) for e in trace["events"])
+    label = (
+        f"🔍 Trace · {total:.0f} ms · {len(trace['events'])} nodes · "
+        f"{tokens_in} in / {tokens_out} out tokens"
+    )
+    with st.expander(label):
+        for ev in trace["events"]:
+            line = f"**{ev['node']}** · {ev['duration_ms']:.0f} ms"
+            extras = []
+            for k in ("attempts", "num_documents", "num_relevant", "answer_chars",
+                      "tokens_in", "tokens_out"):
+                if k in ev["summary"]:
+                    extras.append(f"{k}={ev['summary'][k]}")
+            if "query_used" in ev["summary"]:
+                extras.append(f"query=\"{ev['summary']['query_used']}\"")
+            if extras:
+                line += " · " + " · ".join(extras)
+            if ev.get("error"):
+                line += f" · ❌ {ev['error']}"
+            st.markdown(line)
 
 
 def render_chat():
     st.header("Chat with your document")
 
-    if not st.session_state.store:
+    if not st.session_state.graph:
         st.info("👈 Upload a document in the sidebar to get started.")
         return
 
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
-            if msg["role"] == "assistant" and msg.get("sources"):
-                with st.expander(f"Sources used ({len(msg['sources'])})"):
-                    for i, s in enumerate(msg["sources"], start=1):
-                        st.markdown(
-                            f"**[#{i}]** similarity `{s['score']:.3f}` · "
-                            f"chunk #{s['metadata'].get('chunk_index', '?')}"
-                        )
-                        st.text(s["text"])
+            if msg["role"] == "assistant":
+                if msg.get("query_used") and msg["query_used"] != msg.get("question"):
+                    st.caption(f"🔁 Query rewritten to: *{msg['query_used']}*")
+                if msg.get("sources"):
+                    with st.expander(f"Sources used ({len(msg['sources'])})"):
+                        for i, s in enumerate(msg["sources"], start=1):
+                            st.markdown(
+                                f"**[#{i}]** similarity `{s['score']:.3f}` · "
+                                f"chunk #{s['metadata'].get('chunk_index', '?')}"
+                            )
+                            st.text(s["text"])
+                _render_trace(msg.get("trace"))
 
     question = st.chat_input("Ask a question about the document...")
     if not question:
@@ -180,22 +233,34 @@ def render_chat():
         st.markdown(question)
 
     with st.chat_message("assistant"):
-        with st.spinner("Searching the document and thinking..."):
-            store: VectorStore = st.session_state.store
-            top_k = st.session_state.get("top_k", 4)
-            retrieved = store.query(question, k=top_k)
-
-            # Pass the last few turns (excluding the current user msg) as history.
+        with st.spinner("Retrieving · grading · (rewriting if needed) · answering..."):
+            graph = st.session_state.graph
             history = [
                 (m["role"], m["content"])
                 for m in st.session_state.messages[-7:-1]
             ]
-            answer = generate_answer(question, retrieved, history=history)
+
+            with tracer.new_run(question) as run:
+                final = graph.invoke(
+                    {
+                        "question": question,
+                        "history": history,
+                        "attempts": 0,
+                    }
+                )
+            trace = asdict(run)
+
+            answer = final.get("answer") or "I couldn't find that in the document."
+            query_used = final.get("query_used", question)
+            shown_docs = final.get("relevant_docs") or final.get("documents", [])
 
             st.markdown(answer)
+            if query_used and query_used != question:
+                st.caption(f"🔁 Query rewritten to: *{query_used}*")
+
             sources = [
                 {"text": r.text, "score": r.score, "metadata": r.metadata}
-                for r in retrieved
+                for r in shown_docs
             ]
             with st.expander(f"Sources used ({len(sources)})"):
                 for i, s in enumerate(sources, start=1):
@@ -205,8 +270,17 @@ def render_chat():
                     )
                     st.text(s["text"])
 
+            _render_trace(trace)
+
     st.session_state.messages.append(
-        {"role": "assistant", "content": answer, "sources": sources}
+        {
+            "role": "assistant",
+            "content": answer,
+            "question": question,
+            "query_used": query_used,
+            "sources": sources,
+            "trace": trace,
+        }
     )
 
 
